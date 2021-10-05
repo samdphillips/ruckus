@@ -1,65 +1,15 @@
 #lang racket/base
 
 (require racket/flonum
-         racket/format
          racket/match
          racket/math
-         racket/struct
+         "engine.rkt"
+         "unit.rkt")
 
-         portaudio)
-
-(define leftb  0)
-(define rightb 1)
-
-(struct unit (name k-ins k-outs au-ins au-outs buffers procedure)
-  #:methods gen:custom-write
-  [(define write-proc
-     (make-constructor-style-printer
-      (lambda (v) 'unit)
-      (lambda (v)
-        (list (unquoted-printing-string (~a (unit-name v)))))))])
-
-(define (unit-run1 u eng num-frames)
-  ((unit-procedure u) u eng num-frames))
-
-(struct engine
-  (ext-in ext-out frames audio-bus* control-bus* buffers* units)
-  #:mutable)
-
-(define (engine-audio-bus-ref eng i)
-  (vector-ref (engine-audio-bus* eng) i))
-
-(define (engine-control-bus-ref eng i)
-  (flvector-ref (engine-control-bus* eng) i))
-
-(define (engine-control-bus-set! eng i v)
-  (flvector-set! (engine-control-bus* eng) i v))
-
-;; handle external events:
-;; - add/remove buses
-;; - modify control buses
-;; - list/add/remove/modify units
-;; - stop engine
-(define (engine-process-ext est)
-  (void))
-
-(define (engine-run1 eng num-samples)
-  (engine-process-ext eng)
-  (for ([u (in-list (engine-units eng))])
-    (unit-run1 u eng num-samples)))
-
-(define (engine-current-time eng)
-  (/ (->fl (engine-frames eng)) sample-rate))
-
-(define sample-rate 44100)
-(define time/sample (exact->inexact (/ 1 sample-rate)))
-
-(define alloc-frames 44100)
+;; XXX: use structs for bus addresses can use to guard creation
+;; of units and engine calls
 
 (define two-pi (* 2 pi))
-
-(define (make-audio-bus* size)
-  (build-vector size (lambda (i) (make-flvector alloc-frames))))
 
 (define (make-envf a d v)
   (define b (fl- v (fl/ (fl* (fl- v) a) d)))
@@ -68,14 +18,15 @@
   (define d+a (fl+ d a))
   (lambda (t)
     (cond
-      [(fl<= t a) (fl* t (fl/ v a))]
+      [(fl<= t a) (fl* t ma)]
       [(fl<= t d+a) (fl+ (fl* t md) b)]
       [else 0.0])))
 
-(define envf (make-envf 0.1 1.0 0.75))
+(define envf (make-envf 0.15 0.9 0.8))
 
 (define (make-env-unit trigger-b level-b)
   (unit (gensym 'env)
+        'control
         (vector trigger-b)
         (vector level-b)
         (vector)
@@ -84,7 +35,7 @@
         (let ([start #f])
           (lambda (u eng num-samples)
             (match-define
-              (unit _ (vector trigger-id) (vector level-id) _ _ _ _) u)
+              (unit _ _ (vector trigger-id) (vector level-id) _ _ _ _) u)
             (define trigger (engine-control-bus-ref eng trigger-id))
             (define level
               (cond
@@ -106,6 +57,7 @@
 
 (define (make-sine-unit freq-b out-b)
   (unit (gensym 'sine)
+        'audio
         (vector freq-b)
         (vector)
         (vector)
@@ -113,9 +65,10 @@
         (vector)
         (let ([phase 0.0])
           (lambda (u eng num-frames)
+            (define time/sample (exact->inexact (/ 1 (engine-sample-rate eng))))
             (define buffer-time (fl* (->fl num-frames) time/sample))
             (match-define
-              (unit _ (vector freq-id) _ _ (vector out-id) _ _) u)
+              (unit _ _ (vector freq-id) _ _ (vector out-id) _ _) u)
             (define freq (engine-control-bus-ref eng freq-id))
             (define f (* freq two-pi))
             (define outb (engine-audio-bus-ref eng out-id))
@@ -129,6 +82,7 @@
 (define (make-mult~ v in out)
   ;; XXX: allow name overrides
   (unit (gensym 'mult~)
+        'audio
         (vector)
         (vector)
         (vector in)
@@ -136,7 +90,7 @@
         (vector)
         (lambda (u eng num-frames)
           (match-define
-            (unit _ _ _ (vector in-id) (vector out-id) _ _) u)
+            (unit _ _ _ _ (vector in-id) (vector out-id) _ _) u)
           (define inb (engine-audio-bus-ref eng in-id))
           (define outb (engine-audio-bus-ref eng out-id))
           (for ([i (in-range num-frames)])
@@ -144,6 +98,7 @@
 
 (define (make-multk~ val-bus in-bus out-bus)
   (unit (gensym 'multk~)
+        'audio
         (vector val-bus)
         (vector)
         (vector in-bus)
@@ -151,7 +106,7 @@
         (vector)
         (lambda (u eng num-frames)
           (match-define
-            (unit _ (vector val-id) _ (vector in-id) (vector out-id) _ _) u)
+            (unit _ _ (vector val-id) _ (vector in-id) (vector out-id) _ _) u)
           (define in-buf (engine-audio-bus-ref eng in-id))
           (define out-buf (engine-audio-bus-ref eng out-id))
           (define val (engine-control-bus-ref eng val-id))
@@ -160,6 +115,7 @@
 
 (define (make-copy~ in out)
   (unit (gensym 'copy~)
+        'audio
         (vector)
         (vector)
         (vector in)
@@ -167,40 +123,94 @@
         (vector)
         (lambda (u eng num-frames)
           (match-define
-            (unit _ _ _ (vector in-id) (vector out-id) _ _) u)
+            (unit _ _ _ _ (vector in-id) (vector out-id) _ _) u)
           (define inb (engine-audio-bus-ref eng in-id))
           (define outb (engine-audio-bus-ref eng out-id))
           (for ([i (in-range num-frames)])
             (flvector-set! outb i (flvector-ref inb i))))))
 
-(define real->s16
-  (let ([m (->fl 32767)])
-    (lambda (x)
-      (fl->exact-integer (flround (fl* m x))))))
-
-(define ((buffer-filler eng) setter num-frames)
-  (engine-run1 eng num-frames)
-  (set-engine-frames! eng (+ (engine-frames eng) num-frames))
-  (for ([i (in-range num-frames)]
-        [l (in-flvector (engine-audio-bus-ref test-engine leftb))]
-        [r (in-flvector (engine-audio-bus-ref test-engine rightb))])
-    (setter (* i 2) (real->s16 l))
-    (setter (+ 1 (* i 2)) (real->s16 r))))
-
 (define test-engine
-  (engine #f #f 0
-          (make-audio-bus* 3)
-          (make-flvector   3)
-          (make-audio-bus* 0)
-          (list (make-sine-unit 0 2)
-                (make-env-unit 1 2)
-                (make-multk~ 2 2 leftb)
-                (make-copy~ leftb rightb))))
+  (make-engine #:num-audio-buses 3
+               #:num-control-buses 3
+               #:initial-units
+               #;
+               (list (make-sine-unit 0 0))
+               (list (make-sine-unit 0 2)
+                     (make-env-unit 1 2)
+                     (make-multk~ 2 2 au-left-ch-bus)
+                     (make-copy~ au-left-ch-bus au-right-ch-bus))))
 
-(define (note f)
-  (engine-control-bus-set! test-engine 0 f)
-  (engine-control-bus-set! test-engine 1 1.0))
+(define (note-out f)
+  (when f
+    (engine-control-bus-set! test-engine 0 f)
+    (engine-control-bus-set! test-engine 1 1.0)))
 
-#;
-(match-define (list timer stats stopper)
-  (stream-play (buffer-filler test-engine) 0.2 sample-rate))
+(define note->freq
+  (let ()
+    (define ref 440.0)
+    (define a (expt 2 1/12))
+    (lambda (n)
+      (and n (* ref (expt a n))))))
+
+(define key->note
+  (let ()
+    (define keys
+      (list "1234567890"
+            "qwertyuiop"
+            "asdfghjkl;"
+            "zxcvbnm,./"))
+    (define keymap
+      (for/fold ([h (hash)]) ([n (in-naturals)]
+                              [r (in-list keys)])
+        (for/fold ([h h]) ([c (in-string r)]
+                           [i (in-naturals)])
+          (hash-set h c (- (+ n (* 3 i)) 21)))))
+    (lambda (c) (hash-ref keymap c #f))))
+
+(require racket/class
+         (except-in racket/gui
+                    unit
+                    unit?)
+         threading)
+
+(define w
+  (let ()
+    (define keyb-frame%
+      (class frame%
+        (super-new)
+        (define/override (on-subwindow-char w e)
+          (define keycode
+            (send e get-key-code))
+          (unless (eq? 'release keycode)
+            (~> (key->note keycode)
+                note->freq
+                note-out)))))
+
+    (new keyb-frame%
+         [label "keys"]
+         [width 300]
+         [height 300])))
+
+(engine-start test-engine)
+(send w show #t)
+
+
+
+#|
+(note 440.0)
+(engine-start test-engine)
+(sleep 2)
+(engine-stop test-engine)
+|#
+
+#|
+(require plot)
+(define data null)
+((engine-buffer-filler test-engine)
+ (lambda (i v)
+   (when (even? i)
+     (define x (/ i 2))
+     (set! data (cons (list x v) data))))
+ 44100)
+(plot (list (points (sort data < #:key car))))
+|#
